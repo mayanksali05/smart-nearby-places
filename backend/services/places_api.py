@@ -1,10 +1,11 @@
 from flask import Blueprint, request, jsonify, current_app
-from utils.distance import haversine_distance
-
 import requests
 from pymongo.errors import PyMongoError
 from bson import ObjectId
 
+
+from utils.distance import haversine_distance
+from ml.recommender import recommend_places
 
 places_bp = Blueprint("places", __name__)
 
@@ -40,31 +41,28 @@ def fetch_nearby_places():
             data = response.json()
 
             places = []
-            user_lat = float(lat)
-            user_lng = float(lng)
-
             for element in data.get("elements", []):
                 place_lat = element.get("lat")
                 place_lon = element.get("lon")
 
-                distance = haversine_distance(
-                    user_lat, user_lng,
-                    place_lat, place_lon
-                )
-
                 places.append({
+                    "osm_id": element.get("id"),
                     "name": element.get("tags", {}).get("name", "Unknown"),
                     "type": place_type,
                     "lat": place_lat,
-                    "lon": place_lon,
-                    "distance_km": distance
+                    "lon": place_lon
                 })
 
-
-            if places:
-                current_app.db.places.insert_many(places)
+            # ✅ correct upsert
+            for place in places:
+                current_app.db.places.update_one(
+                    {"osm_id": place["osm_id"]},
+                    {"$set": place},
+                    upsert=True
+                )
 
             return jsonify(places)
+
 
         # ❌ Overpass error → fallback
         raise Exception("Overpass timeout")
@@ -101,3 +99,53 @@ def fetch_nearby_places():
             return jsonify({
                 "error": "Both Overpass and MongoDB failed"
             }), 503
+
+
+@places_bp.route("/recommend", methods=["GET"])
+def recommend():
+    lat = request.args.get("lat")
+    lng = request.args.get("lng")
+    place_type = request.args.get("type", "restaurant")
+    top_n = int(request.args.get("top_n", 10))
+
+    if not lat or not lng:
+        return jsonify({"error": "lat and lng are required"}), 400
+
+    # get cached places only (stable + fast)
+    places = list(
+        current_app.db.places.find(
+            {"type": place_type},
+            {"_id": 0}
+        )
+    )
+
+    if not places:
+        return jsonify({"error": "No places available"}), 404
+
+    # 🔁 STEP 3: deduplicate by osm_id
+    unique_places = {}
+    for place in places:
+        key = place.get("osm_id") or f"{place['lat']}_{place['lon']}_{place['name']}"
+        unique_places[key] = place
+
+    places = list(unique_places.values())
+
+    user_lat = float(lat)
+    user_lng = float(lng)
+
+    # attach distance
+    for place in places:
+        place["distance_km"] = haversine_distance(
+            user_lat,
+            user_lng,
+            place["lat"],
+            place["lon"]
+        )
+
+    recommended = recommend_places(places, top_n=top_n)
+
+    return jsonify({
+        "count": len(recommended),
+        "recommendations": recommended
+    })
+
