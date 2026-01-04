@@ -10,10 +10,40 @@ from ml.recommender import recommend_places
 places_bp = Blueprint("places", __name__)
 
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
+
+
 def serialize_place(place):
     if "_id" in place:
         place["_id"] = str(place["_id"])
     return place
+
+
+def get_city_from_latlng(lat, lng):
+    params = {
+        "lat": lat,
+        "lon": lng,
+        "format": "json"
+    }
+    headers = {
+        "User-Agent": "smart-nearby-places-app"
+    }
+
+    try:
+        res = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=10)
+        if res.status_code == 200:
+            address = res.json().get("address", {})
+            return (
+                address.get("city")
+                or address.get("town")
+                or address.get("village")
+                or address.get("county")
+            )
+    except Exception:
+        pass
+
+    return "Unknown"
+
 
 
 
@@ -21,18 +51,20 @@ def serialize_place(place):
 def fetch_nearby_places():
     lat = request.args.get("lat")
     lng = request.args.get("lng")
+    city = get_city_from_latlng(lat, lng)
     place_type = request.args.get("type", "restaurant")
 
     if not lat or not lng:
         return jsonify({"error": "lat and lng are required"}), 400
 
     query = f"""
-    [out:json];
-    node
-      ["amenity"="{place_type}"]
-      (around:2000,{lat},{lng});
-    out;
-    """
+        [out:json];
+        node
+        ["amenity"~"restaurant|fast_food|cafe|food_court|bar|hotel"]
+        (around:10000,{lat},{lng});
+        out;
+        """
+
 
     try:
         response = requests.post(OVERPASS_URL, data=query, timeout=25)
@@ -50,8 +82,13 @@ def fetch_nearby_places():
                     "name": element.get("tags", {}).get("name", "Unknown"),
                     "type": place_type,
                     "lat": place_lat,
-                    "lon": place_lon
+                    "lon": place_lon,
+                    "lat_bucket": round(place_lat, 1),
+                    "lng_bucket": round(place_lon, 1),
+                    "city": city
                 })
+
+
 
             # ✅ correct upsert
             for place in places:
@@ -111,18 +148,33 @@ def recommend():
     if not lat or not lng:
         return jsonify({"error": "lat and lng are required"}), 400
 
-    # get cached places only (stable + fast)
+    user_lat = float(lat)
+    user_lng = float(lng)
+
+    # 🔑 LOCATION BUCKETS (FIX OPTION 2)
+    lat_bucket = round(user_lat, 1)
+    lng_bucket = round(user_lng, 1)
+
+    # ✅ location-aware cache query
     places = list(
         current_app.db.places.find(
-            {"type": place_type},
+            {
+                "type": place_type,
+                "lat_bucket": lat_bucket,
+                "lng_bucket": lng_bucket
+            },
             {"_id": 0}
         )
     )
 
     if not places:
-        return jsonify({"error": "No places available"}), 404
+        return jsonify({
+            "error": "No places available for this location",
+            "lat_bucket": lat_bucket,
+            "lng_bucket": lng_bucket
+        }), 404
 
-    # 🔁 STEP 3: deduplicate by osm_id
+    # 🔁 deduplicate safely
     unique_places = {}
     for place in places:
         key = place.get("osm_id") or f"{place['lat']}_{place['lon']}_{place['name']}"
@@ -130,10 +182,7 @@ def recommend():
 
     places = list(unique_places.values())
 
-    user_lat = float(lat)
-    user_lng = float(lng)
-
-    # attach distance
+    # 📏 attach distance dynamically
     for place in places:
         place["distance_km"] = haversine_distance(
             user_lat,
@@ -142,6 +191,7 @@ def recommend():
             place["lon"]
         )
 
+    # ⭐ recommendation scoring
     recommended = recommend_places(places, top_n=top_n)
 
     return jsonify({
