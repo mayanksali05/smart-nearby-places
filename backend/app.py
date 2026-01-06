@@ -14,7 +14,12 @@ def create_app():
 
     # Register blueprints
     from services.places_api import places_bp
+    from services.interactions_api import interactions_bp
+
     app.register_blueprint(places_bp, url_prefix="/api/places")
+    app.register_blueprint(interactions_bp, url_prefix="/api/interactions")
+
+
 
     return app
 

@@ -13,6 +13,8 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/reverse"
 
 
+
+
 def serialize_place(place):
     if "_id" in place:
         place["_id"] = str(place["_id"])
@@ -200,7 +202,11 @@ def recommend():
             place["distance_km"] = dist
             filtered.append(place)
 
-    recommended = recommend_places(filtered, top_n=top_n)
+        recommended = recommend_places(
+        filtered,
+        top_n=top_n,
+        user_pref=[place_type]
+    )
 
     return jsonify({
         "radius_m": radius,
